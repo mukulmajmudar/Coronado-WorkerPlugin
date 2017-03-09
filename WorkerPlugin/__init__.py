@@ -5,45 +5,41 @@ from functools import partial
 from uuid import uuid4
 import logging
 import importlib
+import asyncio
+import concurrent.futures
 
+import tornado.concurrent
 import tornado.web
 from tornado import escape
 from tornado.ioloop import IOLoop
+from tornado.platform.asyncio import AsyncIOMainLoop
 
-from Coronado.Concurrent import when
-from Coronado.Config import Config as ConfigBase
 from Coronado.Plugin import AppPlugin as AppPluginBase, \
         CommandLinePlugin as CLPluginBase
 
 logger = logging.getLogger(__name__)
 
-class Config(ConfigBase):
+config = \
+{
+    # "producer" or "consumer"
+    'workerMode': None,
 
-    def __init__(self, keys=None): 
-        if keys is None:
-            keys = []
-        super().__init__(
-        [
-            'workerMode',
-            'workerShutdownDelay'
-        ] + keys)
-
-    def _getWorkerMode(self):
-        '''
-        Return "producer" or "consumer".
-        '''
-        raise NotImplementedError()
-
-    def _getWorkerShutdownDelay(self):
-        return 5.0
-
+    'workerShutdownDelay': 5.0
+}
 
 class AppPlugin(AppPluginBase):
     context = None
 
     # pylint: disable=unused-argument
-    def start(self, app, context):
+    def start(self, context):
         self.context = context
+
+        # Install asyncio/tornado bridge if not already initialized
+        if not IOLoop.initialized():
+            AsyncIOMainLoop().install()
+
+        if 'ioloop' not in context:
+            context['ioloop'] = IOLoop.current()
 
         # Start a worker or proxy based on mode
         mode = context['workerMode']
@@ -62,7 +58,7 @@ class AppPlugin(AppPluginBase):
 
             self.context['ioloop'].run_sync(self.context['worker'].start)
 
-            self.callAppSpecific('start', app, self, self.context)
+            self.callAppSpecific('start', self, self.context)
 
         elif mode == 'producer':
             # Create a producer
@@ -73,11 +69,10 @@ class AppPlugin(AppPluginBase):
         self.context['shortcutAttrs'].append('worker')
 
 
-    def destroy(self, app, context):
-        future = self.context['worker'].destroy()
+    async def destroy(self, context):
+        await self.context['worker'].destroy()
         if self.context['workerMode'] == 'consumer':
-            self.callAppSpecific('destroy', app, self, self.context)
-        return future
+            self.callAppSpecific('destroy', self, self.context)
 
 
     def callAppSpecific(self, functionName, *args, **kwargs):
@@ -184,9 +179,13 @@ class Producer(WorkerInterface):
                 contentEncoding=contentEncoding,
                 **kwargs)
 
-        self._ioloop.add_future(when(requestResult),
-                partial(self._onRequestSent, requestFuture,
-                    expectResponse, requestId, timeout))
+        if requestResult is not None:
+            self._ioloop.add_future(requestResult,
+                    partial(self._onRequestSent, requestFuture,
+                        expectResponse, requestId, timeout))
+        else:
+            self._onRequestSent(requestFuture, expectResponse, requestId,
+                    timeout, None)
 
         # If we are expecting a response, we store our future for some time
         if expectResponse:
@@ -223,7 +222,8 @@ class Producer(WorkerInterface):
         '''
         try:
             # Trap exceptions, if any
-            implFuture.result()
+            if implFuture is not None:
+                implFuture.result()
         except Exception as e:  # pylint: disable=broad-except
             requestFuture.set_exception(e)
         else:
@@ -281,6 +281,8 @@ class Producer(WorkerInterface):
     # Non-public class attributes
     _requestFutures = {}
 
+futureClasses = (tornado.concurrent.Future, asyncio.Future,
+        concurrent.futures.Future)
 
 class Consumer(WorkerInterface):
     '''
@@ -341,8 +343,16 @@ class Consumer(WorkerInterface):
                 return
 
             # Respond when the worker operation is complete
-            self._ioloop.add_future(when(result),
-                    partial(self._respond, requestId, replyTo))
+            if isinstance(result, futureClasses) or asyncio.iscoroutine(result):
+                # Convert coroutine to future
+                if asyncio.iscoroutine(result):
+                    result = asyncio.ensure_future(result)
+                self._ioloop.add_future(result,
+                        partial(self._respond, requestId, replyTo))
+            else:
+                resultFuture = tornado.concurrent.Future()
+                resultFuture.set_result(result)
+                self._respond(requestId, replyTo, resultFuture)
 
 
     # pylint: disable=too-many-arguments
