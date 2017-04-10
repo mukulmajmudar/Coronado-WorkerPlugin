@@ -12,7 +12,8 @@ import tornado.concurrent
 import tornado.web
 from tornado import escape
 from tornado.ioloop import IOLoop
-from tornado.platform.asyncio import AsyncIOMainLoop
+from tornado.platform.asyncio import AsyncIOMainLoop, to_tornado_future, \
+    to_asyncio_future
 
 from Coronado.Plugin import AppPlugin as AppPluginBase, \
         CommandLinePlugin as CLPluginBase
@@ -26,6 +27,9 @@ config = \
 
     'workerShutdownDelay': 5.0
 }
+
+producer = None
+workHandlers = {}
 
 class AppPlugin(AppPluginBase):
     context = None
@@ -44,10 +48,8 @@ class AppPlugin(AppPluginBase):
         # Start a worker or proxy based on mode
         mode = context['workerMode']
         if mode == 'consumer':
-            # Get work handlers
-            workHandlers = self.getAppSpecific('getWorkHandlers')
-
             # Convert to Tornado-style tuple
+            global workHandlers
             workHandlers = [mapping + (self.context,)
                     for mapping in zip(list(workHandlers.keys()),
                         list(workHandlers.values()))]
@@ -62,7 +64,9 @@ class AppPlugin(AppPluginBase):
 
         elif mode == 'producer':
             # Create a producer
-            self.context['worker'] = self.getProducerClass()(self.context)
+            global producer
+            producer = self.context['worker'] = self.getProducerClass()(
+                    self.context)
 
             self.context['ioloop'].run_sync(self.context['worker'].start)
 
@@ -80,16 +84,6 @@ class AppPlugin(AppPluginBase):
                 self.context['appPackage'].__name__ + '.Worker')
         if hasattr(versionMod, functionName):
             getattr(versionMod, functionName)(*args, **kwargs)
-
-
-    def getAppSpecific(self, functionName, *args, **kwargs):
-        result = {}
-        versionMod = importlib.import_module(
-                self.context['appPackage'].__name__ + '.Worker')
-        if hasattr(versionMod, functionName):
-            result = getattr(versionMod, functionName)(*args, **kwargs)
-
-        return result
 
 
     def getProducerClass(self):
@@ -347,6 +341,11 @@ class Consumer(WorkerInterface):
                 # Convert coroutine to future
                 if asyncio.iscoroutine(result):
                     result = asyncio.ensure_future(result)
+
+                # Convert asyncio future to Tornado future
+                if isinstance(result, asyncio.Future):
+                    result = to_tornado_future(result)
+
                 self._ioloop.add_future(result,
                         partial(self._respond, requestId, replyTo))
             else:
@@ -486,3 +485,48 @@ class WorkHandler(object):
         asynchronous, return a future.
         '''
         raise NotImplementedError()
+
+class WorkerNameConflict(Exception):
+    pass
+
+
+def worker(fn):
+    # Make sure function name is unique
+    tag = fn.__name__
+    if tag in workHandlers:
+        raise WorkerNameConflict(
+                'A worker with the name {} already exists'.format(tag))
+
+    async def wrapper(**kwargs):
+        global producer
+        prod = kwargs.get('producer', producer)
+        body = kwargs.get('body', kwargs)
+        contentType = kwargs.get('contentType', 'application/json')
+        contentEncoding = kwargs.get('contentEncoding', 'utf-8')
+        result = prod.request(
+            tag=tag,
+            expectResponse=True,
+            body=body,
+            contentType=contentType,
+            contentEncoding=contentEncoding)
+        if isinstance(result, futureClasses) or asyncio.iscoroutine(result):
+            if isinstance(result, tornado.concurrent.Future):
+                result = to_asyncio_future(result)
+            return await result
+        else:
+            return result
+
+    class Handler(WorkHandler):
+        async def __call__(self):
+            if self.request.contentType == 'application/json':
+                result = fn(self.context, **self.request.body)
+            else:
+                result = fn(self.context, self.request.body)
+            if isinstance(result, futureClasses) or asyncio.iscoroutine(result):
+                return await result
+            else:
+                return result
+
+    workHandlers[tag] = Handler
+
+    return wrapper
